@@ -31,6 +31,7 @@ class SharedPoseBuffer:
         self.write_timestamps = mp.Array('d', POSE_SLOTS)
         self.sequence_numbers = mp.Array('L', POSE_SLOTS)
         self._owns_shm = True
+        self._mac2id_map = dict()
 
     @classmethod
     def attach(
@@ -60,6 +61,9 @@ class SharedPoseBuffer:
     def write_pose(self, tracker_index: int, pose: "TrackerPose") -> None:
         if tracker_index < 0 or tracker_index >= POSE_SLOTS:
             return
+        str_mac = pose.mac
+        if str_mac not in self._mac2id_map:
+            self._mac2id_map[str_mac] = tracker_index
         with self.lock:
             row = self.array[tracker_index]
             row[:3] = pose.position
@@ -97,7 +101,15 @@ class SharedPoseBuffer:
             "write_time": write_time,
             "sequence": sequence,
         }
-
+        
+    def read_pose_by_mac(self, tracker_mac: str):
+        if not tracker_mac in self._mac2id_map:
+            logger.warning(f'Unknown tracker MAC: {tracker_mac}, now we have {self._mac2id_map}')
+            return None
+        
+        tracker_id = self._mac2id_map[tracker_mac]
+        assert isinstance(tracker_id, int), f"mac's tracker id {tracker_id} is not int but {type(tracker_id)}"
+        return self.read_pose(tracker_id)
 
 def _tracker_process_main(mode: str, wifi_info_path: Optional[str], shm_name: str, lock, mac_buffer, write_timestamps, sequence_numbers, stop_event):
     api = UltimateTrackerAPI(mode=mode, wifi_info_path=wifi_info_path)
