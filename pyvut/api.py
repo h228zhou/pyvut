@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 POSE_SLOTS = 5
 POSE_FIELDS = 11  # [px, py, pz, rw, rx, ry, rz, timestamp_ms, buttons, tracking_status, valid_flag]
 MAC_STR_LEN = 64
+SN_STR_LEN = 64
 
 
 class SharedPoseBuffer:
@@ -28,6 +29,7 @@ class SharedPoseBuffer:
         self.array = np.ndarray((POSE_SLOTS, POSE_FIELDS), dtype=np.float64, buffer=self.shm.buf)
         self.lock = mp.Lock()
         self.mac_buffer = mp.Array('c', MAC_STR_LEN * POSE_SLOTS)
+        self.sn_buffer = mp.Array('c', SN_STR_LEN * POSE_SLOTS)
         self.write_timestamps = mp.Array('d', POSE_SLOTS)
         self.sequence_numbers = mp.Array('L', POSE_SLOTS)
         self._owns_shm = True
@@ -39,6 +41,7 @@ class SharedPoseBuffer:
         shm_name: str,
         lock,
         mac_buffer,
+        sn_buffer,
         write_timestamps,
         sequence_numbers,
     ) -> "SharedPoseBuffer":
@@ -48,9 +51,11 @@ class SharedPoseBuffer:
         instance.array = np.ndarray((POSE_SLOTS, POSE_FIELDS), dtype=np.float64, buffer=instance.shm.buf)
         instance.lock = lock
         instance.mac_buffer = mac_buffer
+        instance.sn_buffer = sn_buffer
         instance.write_timestamps = write_timestamps
         instance.sequence_numbers = sequence_numbers
         instance._owns_shm = False
+        instance._mac2id_map = dict()
         return instance
 
     def close(self):
@@ -62,7 +67,7 @@ class SharedPoseBuffer:
         if tracker_index < 0 or tracker_index >= POSE_SLOTS:
             return
         str_mac = pose.mac
-        if str_mac not in self._mac2id_map:
+        if not str_mac in self._mac2id_map:
             self._mac2id_map[str_mac] = tracker_index
         with self.lock:
             row = self.array[tracker_index]
@@ -73,9 +78,13 @@ class SharedPoseBuffer:
             row[9] = float(pose.tracking_status)
             row[10] = 1.0
             raw_mac = pose.mac.encode("utf-8")[:MAC_STR_LEN - 1]
+            raw_sn = pose.sn.encode("utf-8")[:SN_STR_LEN - 1]
             offset = tracker_index * MAC_STR_LEN
+            sn_offset = tracker_index * SN_STR_LEN
             self.mac_buffer[offset:offset + MAC_STR_LEN] = b"\x00" * MAC_STR_LEN
             self.mac_buffer[offset:offset + len(raw_mac)] = raw_mac
+            self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN] = b"\x00" * SN_STR_LEN
+            self.sn_buffer[sn_offset:sn_offset + len(raw_sn)] = raw_sn
             self.write_timestamps[tracker_index] = time.time()
             self.sequence_numbers[tracker_index] += 1
 
@@ -83,14 +92,17 @@ class SharedPoseBuffer:
         if tracker_index < 0 or tracker_index >= POSE_SLOTS:
             return None
         offset = tracker_index * MAC_STR_LEN
+        sn_offset = tracker_index * SN_STR_LEN
         with self.lock:
             row = self.array[tracker_index].copy()
             write_time = self.write_timestamps[tracker_index]
             sequence = int(self.sequence_numbers[tracker_index])
             raw_mac = bytes(self.mac_buffer[offset:offset + MAC_STR_LEN])
+            raw_sn = bytes(self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN])
         if row[10] < 0.5:
             return None
         mac = raw_mac.split(b"\x00", 1)[0]
+        sn = raw_sn.split(b"\x00", 1)[0]
         return {
             "position": row[:3],
             "rotation": row[3:7],
@@ -98,6 +110,7 @@ class SharedPoseBuffer:
             "buttons": int(row[8]),
             "tracking_status": int(row[9]),
             "mac": mac.decode("utf-8", errors="ignore"),
+            "sn": sn.decode("utf-8", errors="ignore"),
             "write_time": write_time,
             "sequence": sequence,
         }
@@ -111,9 +124,9 @@ class SharedPoseBuffer:
         assert isinstance(tracker_id, int), f"mac's tracker id {tracker_id} is not int but {type(tracker_id)}"
         return self.read_pose(tracker_id)
 
-def _tracker_process_main(mode: str, wifi_info_path: Optional[str], shm_name: str, lock, mac_buffer, write_timestamps, sequence_numbers, stop_event):
+def _tracker_process_main(mode: str, wifi_info_path: Optional[str], shm_name: str, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers, stop_event):
     api = UltimateTrackerAPI(mode=mode, wifi_info_path=wifi_info_path)
-    buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, write_timestamps, sequence_numbers)
+    buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers)
 
     def handle_pose(pose: TrackerPose) -> None:
         buffer.write_pose(pose.tracker_index, pose)
@@ -135,6 +148,7 @@ class TrackerPose:
 
     tracker_index: int
     mac: str
+    sn: str
     buttons: int
     tracking_status: int
     timestamp_ms: int
@@ -228,6 +242,7 @@ class UltimateTrackerAPI:
         pose = TrackerPose(
             tracker_index=sample["tracker_index"],
             mac=mac_str(sample["mac"]),
+            sn=sample.get("sn", ""),
             buttons=sample["buttons"],
             tracking_status=sample["tracking_status"],
             timestamp_ms=sample["timestamp_ms"],
@@ -261,6 +276,7 @@ class TrackerService:
                 self._buffer.shm.name,
                 self._buffer.lock,
                 self._buffer.mac_buffer,
+                self._buffer.sn_buffer,
                 self._buffer.write_timestamps,
                 self._buffer.sequence_numbers,
                 self._stop_event,
@@ -293,6 +309,7 @@ class TrackerService:
         return TrackerPose(
             tracker_index=tracker_index,
             mac=data["mac"],
+            sn=data["sn"],
             buttons=data["buttons"],
             tracking_status=data["tracking_status"],
             timestamp_ms=data["timestamp_ms"],

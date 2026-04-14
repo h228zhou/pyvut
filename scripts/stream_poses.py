@@ -28,7 +28,7 @@ def format_pose(pose: TrackerPose) -> str:
     rot = ", ".join(f"{axis: .3f}" for axis in pose.rotation)
     euler = ", ".join(f"{angle: .2f}" for angle in quat_to_euler_deg(pose.rotation))
     return (
-        f"tracker={pose.tracker_index} mac={pose.mac} status={pose.tracking_status} "
+        f"tracker={pose.tracker_index} mac={pose.mac} sn={pose.sn} status={pose.tracking_status} "
         f"pos=({pos}) quat=({rot}) euler_deg=({euler}) buttons={pose.buttons:#06x}"
         f" timestamp_ms={pose.timestamp_ms}"
     )
