@@ -124,8 +124,19 @@ class SharedPoseBuffer:
         assert isinstance(tracker_id, int), f"mac's tracker id {tracker_id} is not int but {type(tracker_id)}"
         return self.read_pose(tracker_id)
 
-def _tracker_process_main(mode: str, wifi_info_path: Optional[str], shm_name: str, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers, stop_event):
-    api = UltimateTrackerAPI(mode=mode, wifi_info_path=wifi_info_path)
+def _tracker_process_main(
+    mode: str,
+    wifi_info_path: Optional[str],
+    debug: bool,
+    shm_name: str,
+    lock,
+    mac_buffer,
+    sn_buffer,
+    write_timestamps,
+    sequence_numbers,
+    stop_event,
+):
+    api = UltimateTrackerAPI(mode=mode, wifi_info_path=wifi_info_path, debug=debug)
     buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers)
 
     def handle_pose(pose: TrackerPose) -> None:
@@ -169,8 +180,9 @@ class UltimateTrackerAPI:
         mode: str = "DONGLE_USB",
         poll_interval: float = 0.001,
         wifi_info_path: Optional[str] = None,
+        debug: bool = False,
     ) -> None:
-        self._group = ViveTrackerGroup(mode=mode, wifi_info_path=wifi_info_path)
+        self._group = ViveTrackerGroup(mode=mode, wifi_info_path=wifi_info_path, debug=debug)
         self._poll_interval = max(0.0, poll_interval)
         self._pose_callbacks: List[PoseCallback] = []
         self._latest_pose: Dict[int, TrackerPose] = {}
@@ -265,7 +277,7 @@ class UltimateTrackerAPI:
 class TrackerService:
     """Runs the tracker polling loop inside its own process and shares poses through shared memory."""
 
-    def __init__(self, mode: str = "DONGLE_USB", wifi_info_path: Optional[str] = None):
+    def __init__(self, mode: str = "DONGLE_USB", wifi_info_path: Optional[str] = None, debug: bool = False):
         self._buffer = SharedPoseBuffer()
         self._stop_event = mp.Event()
         self._process = mp.Process(
@@ -273,6 +285,7 @@ class TrackerService:
             args=(
                 mode,
                 wifi_info_path,
+                debug,
                 self._buffer.shm.name,
                 self._buffer.lock,
                 self._buffer.mac_buffer,
