@@ -12,7 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 
-from .tracker_core import ViveTrackerGroup, mac_str
+from .tracker_core import ViveTrackerGroup, mac_str, set_tracker_core_debug, stage_print
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,7 @@ class SharedPoseBuffer:
         assert isinstance(tracker_id, int), f"mac's tracker id {tracker_id} is not int but {type(tracker_id)}"
         return self.read_pose(tracker_id)
 
+# pair_on_startup is true means manual pairing is required
 def _tracker_process_main(
     mode: str,
     wifi_info_path: Optional[str],
@@ -135,8 +136,15 @@ def _tracker_process_main(
     write_timestamps,
     sequence_numbers,
     stop_event,
+    pair_on_startup = False,
+    
 ):
-    api = UltimateTrackerAPI(mode=mode, wifi_info_path=wifi_info_path, debug=debug)
+    api = UltimateTrackerAPI(
+        mode=mode,
+        wifi_info_path=wifi_info_path,
+        debug=debug,
+        pair_on_startup=pair_on_startup,
+    )
     buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers)
 
     def handle_pose(pose: TrackerPose) -> None:
@@ -181,8 +189,19 @@ class UltimateTrackerAPI:
         poll_interval: float = 0.001,
         wifi_info_path: Optional[str] = None,
         debug: bool = False,
+        pair_on_startup: bool = False,
     ) -> None:
-        self._group = ViveTrackerGroup(mode=mode, wifi_info_path=wifi_info_path, debug=debug)
+        set_tracker_core_debug(debug)
+        stage_print(
+            "A1",
+            f"UltimateTrackerAPI init: mode={mode} poll_interval={poll_interval} pair_on_startup={pair_on_startup}",
+        )
+        self._group = ViveTrackerGroup(
+            mode=mode,
+            wifi_info_path=wifi_info_path,
+            debug=debug,
+            pair_on_startup=pair_on_startup,
+        )
         self._poll_interval = max(0.0, poll_interval)
         self._pose_callbacks: List[PoseCallback] = []
         self._latest_pose: Dict[int, TrackerPose] = {}
@@ -191,6 +210,7 @@ class UltimateTrackerAPI:
         self._running = threading.Event()
 
         self._group.add_pose_listener(self._handle_pose_event)
+        stage_print("A2", "UltimateTrackerAPI pose listener attached")
 
     @property
     def tracker_group(self) -> ViveTrackerGroup:
@@ -204,6 +224,7 @@ class UltimateTrackerAPI:
         if self._thread and self._thread.is_alive():
             return
 
+        stage_print("A3", "Starting UltimateTrackerAPI polling thread")
         self._running.set()
         self._thread = threading.Thread(target=self._loop_forever, daemon=True)
         self._thread.start()
@@ -245,6 +266,7 @@ class UltimateTrackerAPI:
             return list(self._latest_pose.values())
 
     def _loop_forever(self) -> None:
+        stage_print("A4", "UltimateTrackerAPI polling thread entered main loop")
         while self._running.is_set():
             self._group.do_loop()
             if self._poll_interval:
@@ -277,7 +299,13 @@ class UltimateTrackerAPI:
 class TrackerService:
     """Runs the tracker polling loop inside its own process and shares poses through shared memory."""
 
-    def __init__(self, mode: str = "DONGLE_USB", wifi_info_path: Optional[str] = None, debug: bool = False):
+    def __init__(
+        self,
+        mode: str = "DONGLE_USB",
+        wifi_info_path: Optional[str] = None,
+        debug: bool = False,
+        pair_on_startup: bool = False,
+    ):
         self._buffer = SharedPoseBuffer()
         self._stop_event = mp.Event()
         self._process = mp.Process(
@@ -286,6 +314,7 @@ class TrackerService:
                 mode,
                 wifi_info_path,
                 debug,
+                pair_on_startup,
                 self._buffer.shm.name,
                 self._buffer.lock,
                 self._buffer.mac_buffer,

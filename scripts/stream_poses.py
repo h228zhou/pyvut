@@ -47,6 +47,16 @@ def main() -> None:
         dest="wifi_info",
         help="Optional path to a wifi_info.json file (defaults to pyvut/wifi_info.json).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose tracker_core debug logs.",
+    )
+    parser.add_argument(
+        "--pair-on-startup",
+        action="store_true",
+        help="Force the dongle into pair mode immediately on startup. Leave this off for trackers that are already paired.",
+    )
     args = parser.parse_args()
 
     def on_pose(pose: TrackerPose) -> None:
@@ -56,8 +66,17 @@ def main() -> None:
         "Starting UltimateTrackerAPI… Rotations are reported as quaternions (w,x,y,z) and Euler angles (roll, pitch, yaw in degrees)."
         " Trackers emit raw (w,z,y,x) order but pyvut normalizes this for you. Press Ctrl+C to stop."
     )
+    if args.debug:
+        print(
+            "Debug mode is ON. If startup gets stuck, tell me the last '[STEP ...]' line you saw before you had to long-press pair."
+        )
     try:
-        with UltimateTrackerAPI(mode=args.mode, wifi_info_path=args.wifi_info) as api:
+        with UltimateTrackerAPI(
+            mode=args.mode,
+            wifi_info_path=args.wifi_info,
+            debug=args.debug,
+            pair_on_startup=args.pair_on_startup,
+        ) as api:
             api.add_pose_callback(on_pose)
             while True:
                 time.sleep(1)

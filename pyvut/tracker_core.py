@@ -18,28 +18,33 @@ from .enums_horusd_dongle import *
 
 
 logger = logging.getLogger(__name__)
-_VERBOSE_PRINTS = True
+_STAGE_ONCE_KEYS = set()
+
+
+def set_tracker_core_debug(enabled: bool) -> None:
+    """Bind tracker_core stdout prints directly to the public debug flag."""
+
+    logger.disabled = not enabled
+    _STAGE_ONCE_KEYS.clear()
 
 
 def set_tracker_core_verbose(enabled: bool) -> None:
-    """Globally enable/disable verbose logging for tracker_core."""
+    """Backward-compatible alias for older call sites."""
 
-    global _VERBOSE_PRINTS
-    _VERBOSE_PRINTS = enabled
+    set_tracker_core_debug(enabled)
 
 
 def verbose_print(*args, **kwargs):
-    if _VERBOSE_PRINTS:
-        _builtin_print(*args, **kwargs)
+    if logger.disabled:
         return
+    _builtin_print(*args, **kwargs)
 
-    sep = kwargs.get("sep", " ")
-    end = kwargs.get("end", "\n")
-    try:
-        message = sep.join(str(arg) for arg in args) + end.rstrip("\n")
-    except Exception:
-        message = "<unprintable message>"
-    logger.debug(message)
+
+def stage_print(key: str, message: str) -> None:
+    if key in _STAGE_ONCE_KEYS:
+        return
+    _STAGE_ONCE_KEYS.add(key)
+    verbose_print(f"[STEP {key}] {message}")
 
 # Sometimes it will not track w/o:
 # adb shell setprop persist.lambda.trans_setup 1
@@ -156,7 +161,8 @@ class Ackable(object):
 
 class DongleHID(Ackable):
 
-    def __init__(self, wifi_info_path=None):
+    def __init__(self, wifi_info_path=None, pair_on_startup=False):
+        stage_print("01", "DongleHID init: start")
         self.calib_1 = ""
         self.calib_2 = ""
         self.device_macs = []
@@ -174,6 +180,8 @@ class DongleHID(Ackable):
         self.pair_state = [0,0,0,0,0]
         self.connected_to_host = [False]*5
         self.has_host_map = [False]*5
+        self.initialized_slots = [False]*5
+        self._last_pair_state_snapshot = None
 
         self.last_host_map_ask_ms = current_milli_time()
 
@@ -181,12 +189,14 @@ class DongleHID(Ackable):
         self.host_passwd = ""
         self.host_freq = ""
 
+        stage_print("02", "Enumerating VIVE wireless dongle HID devices")
         device_list = hid.enumerate(VID_VIVE, PID_DONGLE)
         verbose_print(device_list)
 
         # TODO better error handling
         device_dict_hid1 = [device for device in device_list if device['interface_number'] == HID1_INTERFACE_NUM][0]
         self.device_hid1 = hid.Device(path=device_dict_hid1['path'])
+        stage_print("03", f"Dongle HID opened at path={device_dict_hid1['path']!r}")
 
         verbose_print(self.get_PCBID()) # RequestPCBID
         verbose_print(self.get_SKUID()) # RequestSKUID
@@ -194,6 +204,7 @@ class DongleHID(Ackable):
         verbose_print(self.get_ShipSN()) # RequestShipSN
         verbose_print(self.get_CapFPC()) # RequestCapFPC
         verbose_print(self.get_ROMVersion()) # QueryROMVersion
+        stage_print("04", "Dongle identity queries completed")
 
         #verbose_print(self.send_cmd(0xEF, bytes([0x06]) + "800001FF".encode("utf-8"))) # Write PCB ID
         #verbose_print(self.send_cmd(0xEF, bytes([0x07]) + "00059E00".encode("utf-8"))) # Write SKU ID
@@ -203,8 +214,13 @@ class DongleHID(Ackable):
         # hex_dump(self.send_cmd(0x21, [0])) # bricked my dongle :(
 
         # 0x1D = ReportRequestRFChangeBehavior?
-        bEnabled = 1
-        verbose_print(self.send_cmd(DCMD_REQUEST_RF_CHANGE_BEHAVIOR, struct.pack("<BBBBBBB", RF_BEHAVIOR_PAIR_DEVICE, bEnabled, 1, 1, 1, 0, 0))) # PairDevice
+        self.pair_on_startup = bool(pair_on_startup)
+        if self.pair_on_startup:
+            bEnabled = 1
+            verbose_print(self.send_cmd(DCMD_REQUEST_RF_CHANGE_BEHAVIOR, struct.pack("<BBBBBBB", RF_BEHAVIOR_PAIR_DEVICE, bEnabled, 1, 1, 1, 0, 0))) # PairDevice
+            stage_print("05", "RF pair behavior enabled on dongle")
+        else:
+            stage_print("05", "Skipped forcing dongle pair mode on startup")
         #verbose_print(self.send_cmd(DCMD_REQUEST_RF_CHANGE_BEHAVIOR, struct.pack("<BBBBBBB", RF_BEHAVIOR_RX_POWER_SAVING, bEnabled, 1, 0, 0, 0, 0))) # RxPowerSaving?
         #verbose_print(self.send_cmd(DCMD_REQUEST_RF_CHANGE_BEHAVIOR, struct.pack("<BBBBBB", RF_BEHAVIOR_RESTART_RF, 1, 0, 0, 0, 0))) # Same as 1 w/ bEnabled
         # 3 = SetLpf (7,8,9,10), not available
@@ -215,6 +231,7 @@ class DongleHID(Ackable):
         wifi_path = Path(wifi_info_path) if wifi_info_path else Path(__file__).with_name('wifi_info.json')
         with wifi_path.open('r', encoding='utf-8') as f:
             self.wifi_info = json.load(f)
+        stage_print("06", f"wifi_info loaded from {wifi_path}")
 
     def parse_response(self, data):
         err_ret, cmd_id, data_len, unk2 = struct.unpack("<BBBH", data[:5])
@@ -231,6 +248,7 @@ class DongleHID(Ackable):
         return cmd_id, ret
 
     def parse_tracker_status(self, data):
+        stage_print("10", "Received first tracker RF status packet from dongle")
         unk, data_len = struct.unpack("<BB", data[:2])
         #verbose_print(f"unk: {hex(unk)} data_len: {hex(data_len)}")
         hex_dump(data[:2])
@@ -242,11 +260,24 @@ class DongleHID(Ackable):
         verbose_print(hex(unk),hex(pair_state[0]),hex(pair_state[1]),hex(pair_state[2]),hex(pair_state[3]),hex(pair_state[4]))
 
         self.pair_state = pair_state
+        snapshot = tuple(self.pair_state)
+        if snapshot != self._last_pair_state_snapshot:
+            self._last_pair_state_snapshot = snapshot
+            summary = []
+            for idx in range(0, 5):
+                summary.append(
+                    f"slot={idx} paired={int((self.pair_state[idx] & PAIR_STATE_PAIRED) != 0)} "
+                    f"init={int(self.initialized_slots[idx])} conn={int(self.connected_to_host[idx])} "
+                    f"host_map={int(self.has_host_map[idx])}"
+                )
+            verbose_print("RF pair_state changed:", " | ".join(summary))
 
-        # Fallback for disconnects
-        if self.current_host_id >= 0:
-            if self.pair_state[self.current_host_id] & PAIR_STATE_PAIRED == 0:
-                self.handle_disconnected(self.current_host_id)
+        for idx in range(0, 5):
+            is_paired = (self.pair_state[idx] & PAIR_STATE_PAIRED) != 0
+            if is_paired and not self.initialized_slots[idx]:
+                self.initialize_slot(idx)
+            elif not is_paired and self.initialized_slots[idx]:
+                self.handle_disconnected(idx)
 
         # pair state:
         # 0x4000003 - unpaired, pairing info present?
@@ -254,6 +285,37 @@ class DongleHID(Ackable):
         # 0x320fc008 - paired
         # 0x320ff808 - paired
         # 0x320fa808 - paired
+
+    def initialize_slot(self, idx):
+        if idx < 0 or idx >= 5:
+            return
+        if self.initialized_slots[idx]:
+            return
+
+        stage_print("20", f"Starting tracker slot initialization flow for slot={idx}")
+        verbose_print(f"Initializing paired tracker slot {idx}")
+        self.ack_set_role_id(idx, 1)
+        self.ack_set_tracking_mode(idx, -1)
+
+        if self.current_host_id == -1 or self.current_host_id == idx:
+            test_mode = TRACKING_MODE_SLAM_HOST
+            self.current_host_id = idx
+            verbose_print(f"Making slot {idx} the SLAM host")
+            self.wifi_set_country(idx, self.wifi_info["country"])
+            self.ack_set_tracking_host(idx, 1)
+            self.ack_set_wifi_host(idx, 1)
+            self.ack_set_new_id(idx, 0)
+        else:
+            test_mode = TRACKING_MODE_SLAM_CLIENT
+            verbose_print(f"Making slot {idx} a SLAM client (host slot={self.current_host_id})")
+            self.ack_set_tracking_host(idx, 0)
+            self.ack_set_wifi_host(idx, 0)
+            self.ack_set_new_id(idx, int(idx))
+
+        self.ack_set_tracking_mode(idx, test_mode)
+        self.initialized_slots[idx] = True
+        verbose_print(f"Initialized slot {idx} with tracking_mode={test_mode}")
+        stage_print("21", f"Initialization commands sent for slot={idx}")
 
 
     def send_raw(self, data=None, pad=True):
@@ -398,6 +460,7 @@ class DongleHID(Ackable):
 
         self.connected_to_host[idx] = False
         self.has_host_map[idx] = False
+        self.initialized_slots[idx] = False
 
         if self.disconnected_callback:
             self.disconnected_callback(self, idx)
@@ -411,6 +474,7 @@ class DongleHID(Ackable):
         #verbose_print("parsed:")
         # 0x18 = paired event, gives the 
         if resp[0] == DRESP_PAIR_EVENT:
+            stage_print("11", "Received pair/unpair event from dongle")
             self.got_a_pair = True
             #verbose_print("dump:")
             #hex_dump(resp)
@@ -434,30 +498,9 @@ class DongleHID(Ackable):
 
             # I really wish they included the index of each tracker *somewhere*, but it seems
             # like the MACs have always been fake anyhow
-            self.ack_set_role_id(mac_to_idx(paired_mac), 1)
-            self.ack_set_tracking_mode(mac_to_idx(paired_mac), -1)
-
-            # TODO: detect re-pairs and force re-init
-            
-            #if self.num_paired <= 1:
-            if self.current_host_id == -1 or self.is_host(paired_mac):
-                test_mode = TRACKING_MODE_SLAM_HOST
-                self.current_host_id = mac_to_idx(paired_mac)
-                verbose_print(f"Making {paired_mac_str} the SLAM host")
-                self.wifi_set_country(mac_to_idx(paired_mac), self.wifi_info["country"])
-                self.ack_set_tracking_host(mac_to_idx(paired_mac), 1)
-                self.ack_set_wifi_host(mac_to_idx(paired_mac), 1)
-                self.ack_set_new_id(mac_to_idx(paired_mac), 0)
-            else:
-                test_mode = TRACKING_MODE_SLAM_CLIENT
-                #self.wifi_connect(mac_to_idx(paired_mac))
-                new_id = int(mac_to_idx(paired_mac))
-
-                self.ack_set_tracking_host(mac_to_idx(paired_mac), 0)
-                self.ack_set_wifi_host(mac_to_idx(paired_mac), 0)
-                self.ack_set_new_id(mac_to_idx(paired_mac), new_id)
-
-            self.ack_set_tracking_mode(mac_to_idx(paired_mac), test_mode)
+            idx = mac_to_idx(paired_mac)
+            self.initialized_slots[idx] = False
+            self.initialize_slot(idx)
 
             
         elif resp[0] == DRESP_TRACKER_RF_STATUS or resp[0] == DRESP_TRACKER_NEW_RF_STATUS or resp[0] == 0x29:
@@ -469,6 +512,7 @@ class DongleHID(Ackable):
             else:
                 hex_dump(data_ret)
         elif resp[0] == DRESP_TRACKER_INCOMING:
+            stage_print("12", "Received first tracker incoming packet from dongle")
             self.parse_tracker_incoming(resp)
             #self.send_raw(bytes([0]) + resp)
 
@@ -694,8 +738,9 @@ class TrackerHID(Ackable):
 
 class ViveTrackerGroup():
 
-    def __init__(self, mode="DONGLE_USB", wifi_info_path=None, debug=True):
-        set_tracker_core_verbose(debug)
+    def __init__(self, mode="DONGLE_USB", wifi_info_path=None, debug=True, pair_on_startup=False):
+        set_tracker_core_debug(debug)
+        stage_print("00", f"ViveTrackerGroup init requested mode={mode}")
         self.poses_recvd = [0]*5
         self.pose_quat = [[0.0, 0.0, 0.0, 1.0]] * 5
         self.pose_pos = [[0.0, 0.0, 0.0]] * 5
@@ -712,20 +757,27 @@ class ViveTrackerGroup():
         self.bump_map_once = [True]*5
         self.bump_map_once_2 = [True]*5
         self.tracker_sn = [""] * 5
+        self.last_reported_pose_status = [None] * 5
+        self.last_reported_map_state = [None] * 5
+        self._last_reported_raw_btn_value = [None] * 5
+        self._warned_preinit_pose_slots = set()
+        self._warned_unexpected_pose_status = set()
 
         self.pose_listeners = []
         self._active_tracker_slots = []
 
         # TODO: mix of multiple?
         if mode == "DONGLE_USB":
-            self.comms = DongleHID(wifi_info_path=wifi_info_path)
+            self.comms = DongleHID(wifi_info_path=wifi_info_path, pair_on_startup=pair_on_startup)
         elif mode == "TRACKER_USB":
             self.comms = TrackerHID(wifi_info_path=wifi_info_path)
+        stage_print("07", f"Tracker transport object created mode={mode}")
 
         self.comms.pose_callback = self.parse_pose_data
         self.comms.ack_callback = self.parse_ack
         self.comms.connected_callback = self.handle_connected
         self.comms.disconnected_callback = self.handle_disconnected
+        stage_print("08", "tracker_core callbacks registered")
 
     def add_pose_listener(self, listener):
         if listener not in self.pose_listeners:
@@ -753,54 +805,68 @@ class ViveTrackerGroup():
         self.tracker_sn[idx] = ""
         if idx in self._active_tracker_slots:
             self._active_tracker_slots.remove(idx)
+        self._last_reported_raw_btn_value[idx] = None
 
     # TODO: comms -> self
     def handle_map_state(self, comms, device_addr, state):
-        self.tracker_map_state[mac_to_idx(device_addr)] = state
+        slot = mac_to_idx(device_addr)
+        stage_print("30", "Received first map-state update from tracker")
+        prev_state = self.tracker_map_state[slot]
+        self.tracker_map_state[slot] = state
+        if self.last_reported_map_state[slot] != state:
+            self.last_reported_map_state[slot] = state
+            try:
+                prev_state_str = map_status_to_str(prev_state)
+            except Exception:
+                prev_state_str = str(prev_state)
+            verbose_print(
+                f"Map state changed slot={slot} sn={self.tracker_sn[slot] or '<unknown>'} "
+                f"{prev_state_str} -> {map_status_to_str(state)}"
+            )
 
-        if self.stuck_on_static[mac_to_idx(device_addr)] > 7:
+        if self.stuck_on_static[slot] > 7:
             verbose_print("ok we're stuck, end the map again")
-            self.bump_map_once_2[mac_to_idx(device_addr)] = True
-            self.stuck_on_static[mac_to_idx(device_addr)] = 0
+            self.bump_map_once_2[slot] = True
+            self.stuck_on_static[slot] = 0
 
-        if self.stuck_on_exists[mac_to_idx(device_addr)] > 3:
-            self.stuck_on_exists[mac_to_idx(device_addr)] = 0
+        if self.stuck_on_exists[slot] > 3:
+            self.stuck_on_exists[slot] = 0
 
-        if self.stuck_on_not_checked[mac_to_idx(device_addr)] > 3:
-            self.stuck_on_not_checked[mac_to_idx(device_addr)] = 0
+        if self.stuck_on_not_checked[slot] > 3:
+            self.stuck_on_not_checked[slot] = 0
 
         if state == MAP_REBUILD_WAIT_FOR_STATIC:
             #comms.send_ack_to(mac_to_idx(device_addr), ACK_LAMBDA_COMMAND + f"{RESET_MAP}")
-            self.stuck_on_static[mac_to_idx(device_addr)] += 1
-            if self.bump_map_once_2[mac_to_idx(device_addr)]:
+            self.stuck_on_static[slot] += 1
+            if self.bump_map_once_2[slot]:
                 if comms.is_client(device_addr):
                     verbose_print("End the map?")
                     #comms.lambda_end_map(comms.current_host_id)
                     #comms.lambda_end_map(device_addr)
                     #comms.send_ack_to(comms.current_host_id, ACK_LAMBDA_COMMAND + f"{ASK_MAP}")
                     #comms.send_ack_to(mac_to_idx(device_addr), ACK_LAMBDA_COMMAND + f"{RESET_MAP}")
-                self.bump_map_once_2[mac_to_idx(device_addr)] = False
+                self.bump_map_once_2[slot] = False
             #comms.send_ack_to(mac_to_idx(device_addr), ACK_LAMBDA_SET_STATUS + f"{KEY_MAP_STATE},{MAP_REBUILT}")
             #comms.send_ack_to(mac_to_idx(device_addr), ACK_LAMBDA_SET_STATUS + f"{KEY_CURRENT_TRACKING_STATE},{MAP_REBUILD_CREATE_MAP}")
         else:
-            self.bump_map_once_2[mac_to_idx(device_addr)] = True
-            self.stuck_on_static[mac_to_idx(device_addr)] = 0
+            self.bump_map_once_2[slot] = True
+            self.stuck_on_static[slot] = 0
 
         if state == MAP_EXIST:
-            if self.stuck_on_exists[mac_to_idx(device_addr)] == 0:# and comms.is_host(device_addr):
+            if self.stuck_on_exists[slot] == 0:# and comms.is_host(device_addr):
                 verbose_print("ok we're stuck on exists, end the map again")
                 #comms.lambda_end_map(device_addr)
-            self.stuck_on_exists[mac_to_idx(device_addr)] += 1
+            self.stuck_on_exists[slot] += 1
         else:
-            self.stuck_on_exists[mac_to_idx(device_addr)] = 0
+            self.stuck_on_exists[slot] = 0
 
         if state == MAP_NOT_CHECKED:
-            if self.stuck_on_not_checked[mac_to_idx(device_addr)] == 0 and comms.is_client(device_addr) and comms.client_has_host_map(device_addr):
+            if self.stuck_on_not_checked[slot] == 0 and comms.is_client(device_addr) and comms.client_has_host_map(device_addr):
                 verbose_print("ok we're stuck on not checked, end the map again")
                 comms.lambda_end_map(device_addr)
-            self.stuck_on_not_checked[mac_to_idx(device_addr)] += 1
+            self.stuck_on_not_checked[slot] += 1
         else:
-            self.stuck_on_not_checked[mac_to_idx(device_addr)] = 0
+            self.stuck_on_not_checked[slot] = 0
 
     def parse_pose_data(self, comms, mac, data):
         #verbose_print(comms, self)
@@ -808,7 +874,10 @@ class ViveTrackerGroup():
 
         if len(data) == 0x2:
             idx, btns = struct.unpack("<BB", data)
-            verbose_print(f"({mac_str(mac)})", hex(idx), "btns:", hex(btns))
+            slot = mac_to_idx(mac)
+            if self._last_reported_raw_btn_value[slot] != btns:
+                self._last_reported_raw_btn_value[slot] = btns
+                verbose_print(f"({mac_str(mac)})", hex(idx), "btns:", hex(btns))
             return
 
         if len(data) != 0x25 and len(data) != 0x27:
@@ -830,19 +899,71 @@ class ViveTrackerGroup():
         #verbose_print(f"({mac_str(mac)})", hex(idx), pose_status_to_str(tracking_status), "btns:", hex(btns), "pos:", pos_arr, "rot:", rot_arr, "acc:", acc_arr, "rot_vel:", rot_vel_arr, "time_delta", current_milli_time() - self.pose_time[mac_to_idx(mac)])
 
         #verbose_print(hex(idx), hex(btns), hex(self.pose_btns[mac_to_idx(mac)]), hex(self.last_pose_btns[mac_to_idx(mac)]))
-        self.pose_quat[mac_to_idx(mac)] = rot_arr
-        self.pose_pos[mac_to_idx(mac)] = pos_arr
-        self.pose_time[mac_to_idx(mac)] = current_milli_time()
-        self.pose_tracking_status[mac_to_idx(mac)] = tracking_status
+        slot = mac_to_idx(mac)
+
+        if hasattr(comms, "initialized_slots") and hasattr(comms, "pair_state"):
+            is_initialized = bool(comms.initialized_slots[slot])
+            is_paired = (comms.pair_state[slot] & PAIR_STATE_PAIRED) != 0
+            if not is_initialized or not is_paired:
+                warn_key = (slot, tracking_status)
+                if warn_key not in self._warned_preinit_pose_slots:
+                    self._warned_preinit_pose_slots.add(warn_key)
+                    verbose_print(
+                        f"Ignoring pre-init pose packet slot={slot} paired={int(is_paired)} "
+                        f"initialized={int(is_initialized)} status_byte={tracking_status}"
+                    )
+                return
+
+        valid_tracking_statuses = {
+            POSE_SYSTEM_NOT_READY,
+            POSE_NO_IMAGES_YET,
+            POSE_NOT_INITIALIZED,
+            POSE_OK,
+            POSE_LOST,
+            POSE_RECENTLY_LOST,
+        }
+        if tracking_status not in valid_tracking_statuses:
+            warn_key = (slot, tracking_status)
+            if warn_key not in self._warned_unexpected_pose_status:
+                self._warned_unexpected_pose_status.add(warn_key)
+                verbose_print(
+                    f"Ignoring pose packet with unexpected tracking_status={tracking_status} "
+                    f"slot={slot} raw_pose_len={len(data)}"
+                )
+            return
+
+        stage_print("40", f"Decoded first pose payload for slot={slot}")
+        self.pose_quat[slot] = rot_arr
+        self.pose_pos[slot] = pos_arr
+        self.pose_time[slot] = current_milli_time()
+        self.pose_tracking_status[slot] = tracking_status
+        if self.last_reported_pose_status[slot] != tracking_status:
+            self.last_reported_pose_status[slot] = tracking_status
+            verbose_print(
+                f"Pose status changed slot={slot} sn={self.tracker_sn[slot] or '<unknown>'} "
+                f"status={tracking_status}({pose_status_to_str(tracking_status)}) "
+                f"pos=({pos_arr[0]:.3f},{pos_arr[1]:.3f},{pos_arr[2]:.3f})"
+            )
+            if tracking_status == POSE_OK:
+                stage_print("41", f"Tracker slot={slot} reached status=2(OK)")
+            elif tracking_status == POSE_LOST:
+                stage_print("42", f"Tracker slot={slot} entered status=3(LOST)")
+            elif tracking_status == POSE_RECENTLY_LOST:
+                stage_print("43", f"Tracker slot={slot} entered status=4(RECENTLY_LOST)")
+            elif tracking_status not in (POSE_SYSTEM_NOT_READY, POSE_NO_IMAGES_YET, POSE_NOT_INITIALIZED):
+                verbose_print(
+                    f"Warning: tracker slot={slot} reported unexpected tracking_status={tracking_status} "
+                    f"raw_pose_len={len(data)}"
+                )
 
         if btns & 0x80:
-            self.last_pose_btns[mac_to_idx(mac)] = self.pose_btns[mac_to_idx(mac)]
-            self.pose_btns[mac_to_idx(mac)] = ((btns & 0x7F) << 8) | self.pose_btns[mac_to_idx(mac)] & 0xFF
+            self.last_pose_btns[slot] = self.pose_btns[slot]
+            self.pose_btns[slot] = ((btns & 0x7F) << 8) | self.pose_btns[slot] & 0xFF
         else:
-            self.last_pose_btns[mac_to_idx(mac)] = self.pose_btns[mac_to_idx(mac)]
-            self.pose_btns[mac_to_idx(mac)] = btns | self.pose_btns[mac_to_idx(mac)] & 0xFF00
+            self.last_pose_btns[slot] = self.pose_btns[slot]
+            self.pose_btns[slot] = btns | self.pose_btns[slot] & 0xFF00
 
-        if (self.pose_btns[mac_to_idx(mac)] & 0x100) == 0x100 and (self.last_pose_btns[mac_to_idx(mac)] & 0x100) == 0x0:# and comms.get_map_state(mac) == MAP_EXIST:
+        if (self.pose_btns[slot] & 0x100) == 0x100 and (self.last_pose_btns[slot] & 0x100) == 0x0:# and comms.get_map_state(mac) == MAP_EXIST:
             verbose_print("end map.")
             comms.lambda_end_map(mac)
 
@@ -850,7 +971,7 @@ class ViveTrackerGroup():
             idx=idx,
             mac=mac,
             tracking_status=tracking_status,
-            buttons=self.pose_btns[mac_to_idx(mac)],
+            buttons=self.pose_btns[slot],
             pos_arr=pos_arr,
             rot_arr=rot_arr,
             acc_arr=acc_arr,
@@ -858,6 +979,7 @@ class ViveTrackerGroup():
         )
 
     def parse_ack(self, comms, device_addr, data_raw):
+        stage_print("13", "Received first ACK packet from tracker")
         data = data_raw.decode("utf-8")
         if data[0:1] == ACK_CATEGORY_CALIB_1:
             data_real = data[1:]
@@ -874,6 +996,8 @@ class ViveTrackerGroup():
 
             if data_real[0:3] == ACK_DEVICE_SN:
                 self.tracker_sn[tracker_slot] = data_real[3:]
+                verbose_print(f"Tracker SN learned slot={tracker_slot} sn={self.tracker_sn[tracker_slot]}")
+                stage_print("22", f"Tracker serial number learned for slot={tracker_slot}")
 
             # Handle post-deviceinfo commands
             if data_real[0:3] == ACK_AZZ:
@@ -932,6 +1056,7 @@ class ViveTrackerGroup():
                     self.handle_map_state(comms, device_addr, state)
                 elif key_id == KEY_CURRENT_TRACKING_STATE:
                     addendum = f"({pose_status_to_str(state)})"
+                    stage_print("31", "Received first current-tracking-state status query response")
 
                 verbose_print(f"   Status returned for SLAM key {slam_key_to_str(key_id)} ({mac_str(device_addr)}): {state} {addendum}")
 

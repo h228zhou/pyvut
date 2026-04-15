@@ -60,7 +60,9 @@ KEY_CURRENT_TRACKING_STATE = 6
 
 _slam_key_strs = ["TRANSMISSION_READY", "RECEIVED_FIRST_FILE", "RECEIVED_HOST_ED", "RECEIVED_HOST_MAP", "CURRENT_MAP_ID", "MAP_STATE", "CURRENT_TRACKING_STATE"]
 def slam_key_to_str(idx):
-    return _slam_key_strs[idx]
+    if 0 <= idx < len(_slam_key_strs):
+        return _slam_key_strs[idx]
+    return f"UNKNOWN_SLAM_KEY({idx})"
 
 # Commands
 ASK_ED = 0
@@ -70,7 +72,9 @@ RESET_MAP = 3
 
 _map_status_strs = ["MAP_NOT_CHECKED","MAP_EXIST","MAP_NOTEXIST","MAP_REBUILT","MAP_SAVE_OK","MAP_SAVE_FAIL","MAP_REUSE_OK","MAP_REUSE_FAIL_FEATURE_DIFF","MAP_REUSE_FAIL_FEATURE_LESS","MAP_REBUILD_WAIT_FOR_STATIC","MAP_REBUILD_CREATE_MAP"]
 def map_status_to_str(idx):
-    return _map_status_strs[idx]
+    if 0 <= idx < len(_map_status_strs):
+        return _map_status_strs[idx]
+    return f"UNKNOWN_MAP_STATUS({idx})"
 
 # Map status
 MAP_NOT_CHECKED = 0
@@ -88,7 +92,11 @@ MAP_REBUILD_CREATE_MAP = 10
 # Pose state
 _pose_status_strs = ["NO_IMAGES_YET", "NOT_INITIALIZED", "OK", "LOST", "RECENTLY_LOST", "SYSTEM_NOT_READY"]
 def pose_status_to_str(idx):
-    return _pose_status_strs[idx]
+    if idx == POSE_SYSTEM_NOT_READY:
+        return "SYSTEM_NOT_READY"
+    if 0 <= idx < len(_pose_status_strs):
+        return _pose_status_strs[idx]
+    return f"UNKNOWN_POSE_STATUS({idx})"
 
 POSE_SYSTEM_NOT_READY = -1
 POSE_NO_IMAGES_YET = 0
