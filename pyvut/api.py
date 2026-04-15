@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 from multiprocessing import shared_memory
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -77,16 +78,38 @@ class SharedPoseBuffer:
             row[8] = float(pose.buttons)
             row[9] = float(pose.tracking_status)
             row[10] = 1.0
-            raw_mac = pose.mac.encode("utf-8")[:MAC_STR_LEN - 1]
-            raw_sn = pose.sn.encode("utf-8")[:SN_STR_LEN - 1]
-            offset = tracker_index * MAC_STR_LEN
-            sn_offset = tracker_index * SN_STR_LEN
-            self.mac_buffer[offset:offset + MAC_STR_LEN] = b"\x00" * MAC_STR_LEN
-            self.mac_buffer[offset:offset + len(raw_mac)] = raw_mac
-            self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN] = b"\x00" * SN_STR_LEN
-            self.sn_buffer[sn_offset:sn_offset + len(raw_sn)] = raw_sn
+            self._write_identity_locked(tracker_index, pose.mac, pose.sn)
             self.write_timestamps[tracker_index] = time.time()
             self.sequence_numbers[tracker_index] += 1
+
+    def write_identity(self, tracker_index: int, mac: str = "", sn: str = "") -> None:
+        if tracker_index < 0 or tracker_index >= POSE_SLOTS:
+            return
+        with self.lock:
+            self._write_identity_locked(tracker_index, mac, sn)
+
+    def _write_identity_locked(self, tracker_index: int, mac: str, sn: str) -> None:
+        raw_mac = (mac or "").encode("utf-8")[:MAC_STR_LEN - 1]
+        raw_sn = (sn or "").encode("utf-8")[:SN_STR_LEN - 1]
+        offset = tracker_index * MAC_STR_LEN
+        sn_offset = tracker_index * SN_STR_LEN
+        self.mac_buffer[offset:offset + MAC_STR_LEN] = b"\x00" * MAC_STR_LEN
+        self.mac_buffer[offset:offset + len(raw_mac)] = raw_mac
+        self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN] = b"\x00" * SN_STR_LEN
+        self.sn_buffer[sn_offset:sn_offset + len(raw_sn)] = raw_sn
+
+    def read_identity(self, tracker_index: int) -> Dict[str, str]:
+        if tracker_index < 0 or tracker_index >= POSE_SLOTS:
+            return {"mac": "", "sn": ""}
+        offset = tracker_index * MAC_STR_LEN
+        sn_offset = tracker_index * SN_STR_LEN
+        with self.lock:
+            raw_mac = bytes(self.mac_buffer[offset:offset + MAC_STR_LEN])
+            raw_sn = bytes(self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN])
+        return {
+            "mac": raw_mac.split(b"\x00", 1)[0].decode("utf-8", errors="ignore"),
+            "sn": raw_sn.split(b"\x00", 1)[0].decode("utf-8", errors="ignore"),
+        }
 
     def read_pose(self, tracker_index: int) -> Optional[Dict]:
         if tracker_index < 0 or tracker_index >= POSE_SLOTS:
@@ -129,6 +152,7 @@ def _tracker_process_main(
     mode: str,
     wifi_info_path: Optional[str],
     debug: bool,
+    pair_on_startup: bool,
     shm_name: str,
     lock,
     mac_buffer,
@@ -136,28 +160,36 @@ def _tracker_process_main(
     write_timestamps,
     sequence_numbers,
     stop_event,
-    pair_on_startup = False,
-    
+    startup_error_queue,
 ):
-    api = UltimateTrackerAPI(
-        mode=mode,
-        wifi_info_path=wifi_info_path,
-        debug=debug,
-        pair_on_startup=pair_on_startup,
-    )
-    buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers)
-
-    def handle_pose(pose: TrackerPose) -> None:
-        buffer.write_pose(pose.tracker_index, pose)
-
-    api.add_pose_callback(handle_pose)
-    api.start()
     try:
+        api = UltimateTrackerAPI(
+            mode=mode,
+            wifi_info_path=wifi_info_path,
+            debug=debug,
+            pair_on_startup=pair_on_startup,
+        )
+        buffer = SharedPoseBuffer.attach(shm_name, lock, mac_buffer, sn_buffer, write_timestamps, sequence_numbers)
+
+        def handle_pose(pose: TrackerPose) -> None:
+            buffer.write_pose(pose.tracker_index, pose)
+
+        api.add_pose_callback(handle_pose)
+        api.start()
         while not stop_event.is_set():
+            tracker_group = api.tracker_group
+            for tracker_index, sn in enumerate(tracker_group.tracker_sn):
+                if sn:
+                    buffer.write_identity(tracker_index, sn=sn)
             stop_event.wait(0.005)
+    except Exception as exc:
+        startup_error_queue.put(f"{type(exc).__name__}: {exc}")
+        raise
     finally:
-        api.stop()
-        buffer.close()
+        if 'api' in locals():
+            api.stop()
+        if 'buffer' in locals():
+            buffer.close()
 
 
 
@@ -306,8 +338,10 @@ class TrackerService:
         debug: bool = False,
         pair_on_startup: bool = False,
     ):
+        self._running = False
         self._buffer = SharedPoseBuffer()
         self._stop_event = mp.Event()
+        self._startup_error_queue = mp.Queue(maxsize=1)
         self._process = mp.Process(
             target=_tracker_process_main,
             args=(
@@ -322,6 +356,7 @@ class TrackerService:
                 self._buffer.write_timestamps,
                 self._buffer.sequence_numbers,
                 self._stop_event,
+                self._startup_error_queue,
             ),
             daemon=True,
         )
@@ -329,6 +364,7 @@ class TrackerService:
         self._last_pose_age_ms: Optional[float] = None
         self._last_pose_sequence: Optional[int] = None
         self._running = True
+        self._assert_process_started()
 
     @property
     def trackers(self):
@@ -360,6 +396,40 @@ class TrackerService:
             acceleration=np.zeros(3),
             angular_velocity=np.zeros(3),
         )
+
+    def get_identity(self, tracker_index: int) -> Dict[str, str]:
+        return self._buffer.read_identity(tracker_index)
+
+    def is_alive(self) -> bool:
+        return bool(self._process and self._process.is_alive())
+
+    def assert_healthy(self) -> None:
+        if self.is_alive():
+            return
+        startup_error = self._read_startup_error()
+        detail = f": {startup_error}" if startup_error else ""
+        raise RuntimeError(f"Tracker backend process is not running{detail}")
+
+    def _assert_process_started(self, startup_timeout_s: float = 0.5) -> None:
+        deadline = time.time() + max(startup_timeout_s, 0.0)
+        while time.time() < deadline and self._process.is_alive():
+            startup_error = self._read_startup_error()
+            if startup_error:
+                self.stop()
+                raise RuntimeError(f"Tracker backend failed during startup: {startup_error}")
+            time.sleep(0.01)
+        if self._process.is_alive():
+            return
+        startup_error = self._read_startup_error()
+        self.stop()
+        detail = f": {startup_error}" if startup_error else f" with exit code {self._process.exitcode}"
+        raise RuntimeError(f"Tracker backend exited during startup{detail}")
+
+    def _read_startup_error(self) -> Optional[str]:
+        try:
+            return self._startup_error_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def stop(self):
         if not self._running:

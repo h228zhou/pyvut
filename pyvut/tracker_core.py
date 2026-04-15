@@ -159,6 +159,11 @@ class Ackable(object):
     def ack_lambda_property(self, idx):
         self.send_ack_to(idx, ACK_LAMBDA_PROPERTY)
 
+    def request_device_info(self, idx):
+        # `NA` is the only observed ACK that reliably re-triggers the tracker to
+        # resend its device-info payloads (`NADS`, `NASS`, ...), which includes SN.
+        self.send_ack_to(idx, ACK_NA)
+
 class DongleHID(Ackable):
 
     def __init__(self, wifi_info_path=None, pair_on_startup=False):
@@ -181,6 +186,8 @@ class DongleHID(Ackable):
         self.connected_to_host = [False]*5
         self.has_host_map = [False]*5
         self.initialized_slots = [False]*5
+        self.last_device_info_request_ms = [0] * 5
+        self.device_info_request_attempts = [0] * 5
         self._last_pair_state_snapshot = None
 
         self.last_host_map_ask_ms = current_milli_time()
@@ -193,8 +200,13 @@ class DongleHID(Ackable):
         device_list = hid.enumerate(VID_VIVE, PID_DONGLE)
         verbose_print(device_list)
 
-        # TODO better error handling
-        device_dict_hid1 = [device for device in device_list if device['interface_number'] == HID1_INTERFACE_NUM][0]
+        hid1_devices = [device for device in device_list if device['interface_number'] == HID1_INTERFACE_NUM]
+        if not hid1_devices:
+            raise RuntimeError(
+                "No VIVE wireless dongle HID device was found on interface 0. "
+                f"enumerate() returned {len(device_list)} matching device(s)."
+            )
+        device_dict_hid1 = hid1_devices[0]
         self.device_hid1 = hid.Device(path=device_dict_hid1['path'])
         stage_print("03", f"Dongle HID opened at path={device_dict_hid1['path']!r}")
 
@@ -246,6 +258,12 @@ class DongleHID(Ackable):
 
         ret = data[4:4+data_len-4]
         return cmd_id, ret
+
+    def request_device_info(self, idx):
+        super().request_device_info(idx)
+        if 0 <= idx < len(self.last_device_info_request_ms):
+            self.last_device_info_request_ms[idx] = current_milli_time()
+            self.device_info_request_attempts[idx] += 1
 
     def parse_tracker_status(self, data):
         stage_print("10", "Received first tracker RF status packet from dongle")
@@ -316,6 +334,10 @@ class DongleHID(Ackable):
         self.initialized_slots[idx] = True
         verbose_print(f"Initialized slot {idx} with tracking_mode={test_mode}")
         stage_print("21", f"Initialization commands sent for slot={idx}")
+        self.request_device_info(idx)
+        verbose_print(
+            f"Requested device info for slot={idx} attempt={self.device_info_request_attempts[idx]} reason=post-init"
+        )
 
 
     def send_raw(self, data=None, pad=True):
@@ -461,6 +483,8 @@ class DongleHID(Ackable):
         self.connected_to_host[idx] = False
         self.has_host_map[idx] = False
         self.initialized_slots[idx] = False
+        self.last_device_info_request_ms[idx] = 0
+        self.device_info_request_attempts[idx] = 0
 
         if self.disconnected_callback:
             self.disconnected_callback(self, idx)
@@ -759,7 +783,8 @@ class ViveTrackerGroup():
         self.tracker_sn = [""] * 5
         self.last_reported_pose_status = [None] * 5
         self.last_reported_map_state = [None] * 5
-        self._last_reported_raw_btn_value = [None] * 5
+        self._last_sn_request_ms = [0] * 5
+        self._sn_request_interval_ms = 1500
         self._warned_preinit_pose_slots = set()
         self._warned_unexpected_pose_status = set()
 
@@ -805,12 +830,30 @@ class ViveTrackerGroup():
         self.tracker_sn[idx] = ""
         if idx in self._active_tracker_slots:
             self._active_tracker_slots.remove(idx)
-        self._last_reported_raw_btn_value[idx] = None
+        self._last_sn_request_ms[idx] = 0
+
+    def maybe_request_device_info(self, comms, slot, reason, force=False):
+        if slot < 0 or slot >= len(self.tracker_sn):
+            return
+        if self.tracker_sn[slot]:
+            return
+        if not hasattr(comms, "request_device_info"):
+            return
+        now_ms = current_milli_time()
+        # Already-paired trackers may stream pose before they resend `NADS`.
+        # Periodically nudge them for device info so upper layers can key by SN.
+        if not force and (now_ms - self._last_sn_request_ms[slot]) < self._sn_request_interval_ms:
+            return
+        self._last_sn_request_ms[slot] = now_ms
+        comms.request_device_info(slot)
+        attempt = getattr(comms, "device_info_request_attempts", [None] * len(self.tracker_sn))[slot]
+        verbose_print(f"Requested device info for slot={slot} attempt={attempt} reason={reason}")
 
     # TODO: comms -> self
     def handle_map_state(self, comms, device_addr, state):
         slot = mac_to_idx(device_addr)
         stage_print("30", "Received first map-state update from tracker")
+        self.maybe_request_device_info(comms, slot, "map-state", force=False)
         prev_state = self.tracker_map_state[slot]
         self.tracker_map_state[slot] = state
         if self.last_reported_map_state[slot] != state:
@@ -873,11 +916,6 @@ class ViveTrackerGroup():
         self.poses_recvd[mac_to_idx(mac)] += 1
 
         if len(data) == 0x2:
-            idx, btns = struct.unpack("<BB", data)
-            slot = mac_to_idx(mac)
-            if self._last_reported_raw_btn_value[slot] != btns:
-                self._last_reported_raw_btn_value[slot] = btns
-                verbose_print(f"({mac_str(mac)})", hex(idx), "btns:", hex(btns))
             return
 
         if len(data) != 0x25 and len(data) != 0x27:
@@ -932,6 +970,7 @@ class ViveTrackerGroup():
                 )
             return
 
+        self.maybe_request_device_info(comms, slot, "valid-pose", force=False)
         stage_print("40", f"Decoded first pose payload for slot={slot}")
         self.pose_quat[slot] = rot_arr
         self.pose_pos[slot] = pos_arr
@@ -996,6 +1035,7 @@ class ViveTrackerGroup():
 
             if data_real[0:3] == ACK_DEVICE_SN:
                 self.tracker_sn[tracker_slot] = data_real[3:]
+                self._last_sn_request_ms[tracker_slot] = 0
                 verbose_print(f"Tracker SN learned slot={tracker_slot} sn={self.tracker_sn[tracker_slot]}")
                 stage_print("22", f"Tracker serial number learned for slot={tracker_slot}")
 

@@ -80,7 +80,24 @@ with UltimateTrackerAPI(mode="DONGLE_USB") as api:
 - `UltimateTrackerAPI` supports both dongle (`mode="DONGLE_USB"`) and direct USB tracker (`mode="TRACKER_USB"`) paths.
 - Use `api.get_latest_pose(idx)` to fetch the current pose for a tracker without registering callbacks.
 - Provide a custom Wi-Fi config via `UltimateTrackerAPI(..., wifi_info_path="/path/to/wifi_info.json")` if you do not want to edit the packaged default.
+- Leave `pair_on_startup=False` when trackers are already paired. In that mode pyvut now avoids forcing dongle pair mode and actively requests device info so already-paired trackers can resend `NADS`/serial-number metadata without a manual long-press re-pair.
 - Prefer a quick CLI demo? Run `python scripts/stream_poses.py --mode DONGLE_USB` to print live pose samples.
+
+For the higher-level wrapper in `../../ultimate_tracker.py`, the recommended startup flow is to wait for the tracker serial numbers you care about before starting application logic:
+
+```python
+from ultimate_tracker import UltimateTracker
+
+tracker = UltimateTracker(pair_on_startup=False, auto_start=True)
+ok = tracker.wait_sns(["FA61G3B00044"], timeout=10.0)
+if not ok:
+    raise RuntimeError("required trackers were not discovered in time")
+
+pose = tracker.get_pose_by_sn("FA61G3B00044")
+```
+
+- `wait_sns(...)` accepts either a single `str` or a `list[str]` and blocks until all requested tracker SNs are discovered.
+- `get_sns()` returns discovered tracker SNs even before the first valid pose is cached, so it is suitable for startup gating.
 
 ## Repository Map
 
@@ -92,6 +109,8 @@ with UltimateTrackerAPI(mode="DONGLE_USB") as api:
 	- `enums_*.py`: command and response constants (USB HID, RF, Wi-Fi, status, ACKs, dongle commands).
 - `scripts/visualize_pygame.py`: lightweight pygame visualizer for up to 5 trackers.
 - `scripts/stream_poses.py`: CLI demo that prints pose samples via `UltimateTrackerAPI`.
+- `../../test_ultimate_tracker.py`: higher-level test for `ultimate_tracker/ultimate_tracker.py`; prints raw slot state, discovered SNs, and cached poses so you can verify `pair_on_startup` and SN discovery end-to-end.
+- `../../test_ultimate_tracker.py --wait-sns FA61G3B00044 --wait-timeout 10`: quick way to verify that a required tracker SN is discovered before pose-dependent code starts.
 - `ota_parse.py`: extracts and CRC-checks partitions from HTC OTA firmware images (`trackers/firmware/TX_FW.ota`).
 - `how-to-use.md`: this README distilled version; keep it handy for detailed background.
 
@@ -109,6 +128,7 @@ with UltimateTrackerAPI(mode="DONGLE_USB") as api:
 
 ### pyvut helpers (`pyvut/`)
 - `DongleHID` pairs trackers, assigns SLAM host/role, forwards ACKs, and maintains Wi-Fi credentials.
+- For already-paired trackers, `DongleHID` now sends a lightweight device-info request after slot init and during early pose/map traffic until the tracker resends its SN.
 - `TrackerHID` offers a direct USB transport option (`ViveTrackerGroup(mode="TRACKER_USB")`).
 - `ViveTrackerGroup` keeps arrays of poses and exposes `get_pos(idx)`/`get_rot(idx)` for consumers.
 - SLAM/map helpers react to ACKs (`ACK_MAP_STATUS`, `ACK_LAMBDA_STATUS`, etc.) by requesting or ending maps when trackers get stuck.
