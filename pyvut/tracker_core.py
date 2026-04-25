@@ -774,6 +774,7 @@ class ViveTrackerGroup():
         self.last_pose_btns = [0]*5
         #self.wip_pose_btns = [0]*5
 
+        self.tracker_current_map_id = [-1] * 5
         self.tracker_map_state = [0]*5
         self.stuck_on_static = [0]*5
         self.stuck_on_exists = [0]*5
@@ -782,6 +783,7 @@ class ViveTrackerGroup():
         self.bump_map_once_2 = [True]*5
         self.tracker_sn = [""] * 5
         self.last_reported_pose_status = [None] * 5
+        self.last_reported_map_id = [None] * 5
         self.last_reported_map_state = [None] * 5
         self._last_sn_request_ms = [0] * 5
         self._sn_request_interval_ms = 1500
@@ -821,6 +823,7 @@ class ViveTrackerGroup():
         if idx < 0:
             return
 
+        self.tracker_current_map_id[idx] = -1
         self.tracker_map_state[idx] = 0
         self.stuck_on_static[idx] = 0
         self.stuck_on_exists[idx] = 0
@@ -828,6 +831,9 @@ class ViveTrackerGroup():
         self.bump_map_once[idx] = True
         self.bump_map_once_2[idx] = True
         self.tracker_sn[idx] = ""
+        self.last_reported_map_id[idx] = None
+        self.last_reported_map_state[idx] = None
+        self.last_reported_pose_status[idx] = None
         if idx in self._active_tracker_slots:
             self._active_tracker_slots.remove(idx)
         self._last_sn_request_ms[idx] = 0
@@ -910,6 +916,17 @@ class ViveTrackerGroup():
             self.stuck_on_not_checked[slot] += 1
         else:
             self.stuck_on_not_checked[slot] = 0
+
+    def handle_map_id(self, comms, device_addr, map_id):
+        slot = mac_to_idx(device_addr)
+        self.maybe_request_device_info(comms, slot, "map-id", force=False)
+        self.tracker_current_map_id[slot] = int(map_id)
+        if self.last_reported_map_id[slot] != map_id:
+            self.last_reported_map_id[slot] = int(map_id)
+            verbose_print(
+                f"Map id changed slot={slot} sn={self.tracker_sn[slot] or '<unknown>'} "
+                f"map_id={int(map_id)}"
+            )
 
     def parse_pose_data(self, comms, mac, data):
         #verbose_print(comms, self)
@@ -1094,6 +1111,8 @@ class ViveTrackerGroup():
                     addendum = f"({map_status_to_str(state)})"
 
                     self.handle_map_state(comms, device_addr, state)
+                elif key_id == KEY_CURRENT_MAP_ID:
+                    self.handle_map_id(comms, device_addr, state)
                 elif key_id == KEY_CURRENT_TRACKING_STATE:
                     addendum = f"({pose_status_to_str(state)})"
                     stage_print("31", "Received first current-tracking-state status query response")
@@ -1146,6 +1165,7 @@ class ViveTrackerGroup():
             data_real = data[2:]
             status = [int(s) for s in data_real.split(",")]
 
+            self.handle_map_id(comms, device_addr, status[0])
             self.handle_map_state(comms, device_addr, status[1])
 
             verbose_print(f"   Got MAP_STATUS ({mac_str(device_addr)}):", status, f"({map_status_to_str(status[1])})")
@@ -1189,6 +1209,8 @@ class ViveTrackerGroup():
             "buttons": int(self.pose_btns[idx]),
             "tracking_status": int(self.pose_tracking_status[idx]),
             "timestamp_ms": int(self.pose_time[idx]),
+            "current_map_id": int(self.tracker_current_map_id[idx]),
+            "map_state": int(self.tracker_map_state[idx]),
         }
 
     def do_loop(self):
@@ -1210,6 +1232,8 @@ class ViveTrackerGroup():
             "buttons": buttons,
             "tracking_status": tracking_status,
             "timestamp_ms": self.pose_time[tracker_slot],
+            "current_map_id": int(self.tracker_current_map_id[tracker_slot]),
+            "map_state": int(self.tracker_map_state[tracker_slot]),
             "position": np.array(pos_arr, dtype=np.float32),
             "rotation": np.array(rot_arr, dtype=np.float32),
             "acceleration": np.array(acc_arr, dtype=np.float32),

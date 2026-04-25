@@ -18,7 +18,7 @@ from .tracker_core import ViveTrackerGroup, mac_str, set_tracker_core_debug, sta
 logger = logging.getLogger(__name__)
 
 POSE_SLOTS = 5
-POSE_FIELDS = 11  # [px, py, pz, rw, rx, ry, rz, timestamp_ms, buttons, tracking_status, valid_flag]
+POSE_FIELDS = 13  # [px, py, pz, rw, rx, ry, rz, timestamp_ms, buttons, tracking_status, current_map_id, map_state, valid_flag]
 MAC_STR_LEN = 64
 SN_STR_LEN = 64
 
@@ -77,7 +77,9 @@ class SharedPoseBuffer:
             row[7] = pose.timestamp_ms
             row[8] = float(pose.buttons)
             row[9] = float(pose.tracking_status)
-            row[10] = 1.0
+            row[10] = float(pose.current_map_id)
+            row[11] = float(pose.map_state)
+            row[12] = 1.0
             self._write_identity_locked(tracker_index, pose.mac, pose.sn)
             self.write_timestamps[tracker_index] = time.time()
             self.sequence_numbers[tracker_index] += 1
@@ -122,7 +124,7 @@ class SharedPoseBuffer:
             sequence = int(self.sequence_numbers[tracker_index])
             raw_mac = bytes(self.mac_buffer[offset:offset + MAC_STR_LEN])
             raw_sn = bytes(self.sn_buffer[sn_offset:sn_offset + SN_STR_LEN])
-        if row[10] < 0.5:
+        if row[12] < 0.5:
             return None
         mac = raw_mac.split(b"\x00", 1)[0]
         sn = raw_sn.split(b"\x00", 1)[0]
@@ -132,6 +134,8 @@ class SharedPoseBuffer:
             "timestamp_ms": int(row[7]),
             "buttons": int(row[8]),
             "tracking_status": int(row[9]),
+            "current_map_id": int(row[10]),
+            "map_state": int(row[11]),
             "mac": mac.decode("utf-8", errors="ignore"),
             "sn": sn.decode("utf-8", errors="ignore"),
             "write_time": write_time,
@@ -202,6 +206,8 @@ class TrackerPose:
     sn: str
     buttons: int
     tracking_status: int
+    current_map_id: int
+    map_state: int
     timestamp_ms: int
     position: np.ndarray
     rotation: np.ndarray
@@ -311,6 +317,8 @@ class UltimateTrackerAPI:
             sn=sample.get("sn", ""),
             buttons=sample["buttons"],
             tracking_status=sample["tracking_status"],
+            current_map_id=sample.get("current_map_id", -1),
+            map_state=sample.get("map_state", 0),
             timestamp_ms=sample["timestamp_ms"],
             position=sample["position"],
             rotation=sample["rotation"],
@@ -390,6 +398,8 @@ class TrackerService:
             sn=data["sn"],
             buttons=data["buttons"],
             tracking_status=data["tracking_status"],
+            current_map_id=data.get("current_map_id", -1),
+            map_state=data.get("map_state", 0),
             timestamp_ms=data["timestamp_ms"],
             position=np.array(data["position"], dtype=float),
             rotation=np.array(data["rotation"], dtype=float),
