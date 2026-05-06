@@ -161,20 +161,20 @@ def send_command(cmd_id, data=None):
         data = []
     out = struct.pack("<HBB", cmd_id, len(data), 0)
     out += bytes(data)
-
     out += bytes([0x0] * (0x40 - len(out)))
 
-    try:
-        ret = device_hid1.send_feature_report(out)
-        for i in range(0, 10):
-            resp = device_hid1.get_feature_report(0, 0x40)
-            #hex_dump(resp)
-            cmd_ret, data_ret = parse_response(resp)
-            #hex_dump(data_ret)
-            if cmd_ret == cmd_id:
-                return data_ret
-    except:
-        return bytes([])
+    # try:
+    ret = device_hid1.send_feature_report(out)
+    for i in range(0, 10):
+        resp = device_hid1.get_feature_report(0, 0x40)
+        #hex_dump(resp)
+        print(f"[cmd {hex(cmd_id)}] resp:", resp[:16].hex(), "...")
+        cmd_ret, data_ret = parse_response(resp)
+        #hex_dump(data_ret)
+        if cmd_ret == cmd_id:
+            return data_ret
+    # except:
+    #     return bytes([])
 
     return bytes([])
 
@@ -211,8 +211,12 @@ def set_str_info(idx, val):
 
 def get_status():
     ret = send_command(PACKET_GET_STATUS)
-    tracking_mode, power, batt, hmd_init, device_status_mask, btn = struct.unpack("<BBBBBL", ret)
-    print(f"tracking_mode={tracking_mode}, power={power}, batt={batt}, hmd_init={hmd_init}, device_status_mask={hex(device_status_mask)}, btn={hex(btn)}")
+    if len(ret) < 9:
+        print("get_status: no reply, ret =", ret.hex())
+        return
+    tracking_mode, power, batt, hmd_init, device_status_mask, btn = struct.unpack("<BBBBBL", ret[:9])
+    print(f"tracking_mode={tracking_mode}, power={power}, batt={batt}, "
+          f"hmd_init={hmd_init}, device_status_mask={hex(device_status_mask)}, btn={hex(btn)}")
 
 def set_tracking_mode(mode):
     send_command(PACKET_SET_TRACKING_MODE, [mode])
@@ -292,14 +296,27 @@ def set_camera_fps(val):
 
 #get_property("ro.build.fingerprint")
 
+# import time
+
+# set_camera_policy(3); time.sleep(0.2)
+# set_camera_fps(60);   time.sleep(0.2)
+
+# for mode in (2, 3, 1):            # try body-tracking modes first
+#     print(f"--- trying set_power_pcvr({mode}) ---")
+#     set_power_pcvr(mode); time.sleep(0.5)
+#     get_status()
+#     time.sleep(0.5)
 
 set_camera_policy(3)
 set_camera_fps(60)
 
+
+
 # Seems to get packets flowing?
-set_power_pcvr(1)
-#for i in range(0, 1000):
-#while True:
-#    parse_incoming()
-#    kick_watchdog()
-    #get_ack()
+set_power_pcvr(20)
+get_status()
+for i in range(0, 1000):
+    while True:
+        parse_incoming()
+        kick_watchdog()
+        get_ack()

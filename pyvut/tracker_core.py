@@ -611,7 +611,10 @@ class TrackerHID(Ackable):
 
     def get_status(self):
         ret = self.send_command(PACKET_GET_STATUS)
-        tracking_mode, power, batt, hmd_init, device_status_mask, btn = struct.unpack("<BBBBBL", ret)
+        if len(ret) < 9:
+            verbose_print(f"get_status: short reply len={len(ret)} ret={ret.hex()}")
+            return
+        tracking_mode, power, batt, hmd_init, device_status_mask, btn = struct.unpack("<BBBBBL", ret[:9])
         verbose_print(f"tracking_mode={tracking_mode}, power={power}, batt={batt}, hmd_init={hmd_init}, device_status_mask={hex(device_status_mask)}, btn={hex(btn)}")
 
     def set_tracking_mode(self, mode):
